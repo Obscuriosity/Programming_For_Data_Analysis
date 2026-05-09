@@ -10,6 +10,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
+# Suppress TensorFlow GPU warnings if no GPU is available
 tf.config.set_visible_devices([], 'GPU')
 
 from sklearn.experimental import enable_iterative_imputer
@@ -17,14 +18,160 @@ from sklearn.impute import IterativeImputer
 from sklearn.metrics import mean_absolute_error
 import pickle
 
-# data Loading
-@st.cache_data
-def load_data():
-    df = pd.read_pickle('df.pkl')
-    df_daily = pd.read_pickle('df_daily.pkl')
-    df_ann = pd.read_pickle('df_ann.pkl')
+# function to calculate Individual Air Quality Index (IAQI)
+def calculate_iaqi(C, pollutant_name):
+    breakpoints = {
+        'PM2.5': { # Units: ug/m^3 (24-hour average for AQI)
+            'C': [0, 35, 75, 115, 150, 250, 500],
+            'IAQI': [0, 50, 100, 150, 200, 300, 500]
+        },
+        'PM10': { # Units: ug/m^3 (24-hour average for AQI)
+            'C': [0, 50, 150, 250, 350, 420, 600],
+            'IAQI': [0, 50, 100, 150, 200, 300, 500]
+        },
+        'SO2': { # Units: ug/m^3 (24-hour average for AQI, adjusted for 1601-2100 breakpoint)
+            'C': [0, 50, 150, 475, 800, 1600, 2100, 2620],
+            'IAQI': [0, 50, 100, 150, 200, 300, 400, 500]
+        },
+        'NO2': { # Units: ug/m^3 (24-hour average for AQI, but 1-hour breakpoints for higher levels)
+            'C': [0, 40, 80, 180, 280, 565, 1130],
+            'IAQI': [0, 50, 100, 150, 200, 300, 500]
+        },
+        'CO': { # Units: mg/m^3 (24-hour average for AQI)
+            'C': [0, 2, 4, 14, 24, 36, 60],
+            'IAQI': [0, 50, 100, 150, 200, 300, 500]
+        },
+        'O3': { # Units: ug/m^3 (8-hour average for AQI, but 1-hour breakpoints for higher levels)s)
+            'C': [0, 100, 160, 215, 265, 800, 1200],
+            'IAQI': [0, 50, 100, 150, 200, 300, 500]
+        }
+    }
 
-    # convert datetime columns to string
+    if pollutant_name not in breakpoints:
+        return np.nan
+
+    bp_c = breakpoints[pollutant_name]['C']
+    bp_iaqi = breakpoints[pollutant_name]['IAQI']
+
+    # treat negative concentrations as 0 for calculation
+    if C < 0:
+        C = 0
+
+    # find the breakpoint interval
+    for i in range(len(bp_c) - 1):
+        if bp_c[i] <= C < bp_c[i+1]:
+            C_low = bp_c[i]
+            C_high = bp_c[i+1]
+            IAQI_low = bp_iaqi[i]
+            IAQI_high = bp_iaqi[i+1]
+
+            if C_high == C_low:
+                return IAQI_low
+
+            iaqi = ((IAQI_high - IAQI_low) / (C_high - C_low)) * (C - C_low) + IAQI_low
+            return round(iaqi)
+
+    # if concentration is greater than or equal to the highest breakpoint
+    if C >= bp_c[-1]:
+        return bp_iaqi[-1]
+
+    return np.nan
+
+# Data Generation and Preprocessing
+@st.cache_data
+def generate_all_dataframes():
+    # load monitoring station data CSV and make pandas dataframes
+    df_dongsi = pd.read_csv('/content/Programming_for_Data_Analysis/Data/PRSA_Data_Dongsi_20130301-20170228.csv')
+    df_Gucheng = pd.read_csv('/content/Programming_for_Data_Analysis/Data/PRSA_Data_Gucheng_20130301-20170228.csv')
+    df_Changpingzhen = pd.read_csv('/content/Programming_for_Data_Analysis/Data/PRSA_Data_Changping_20130301-20170228.csv')
+    df_Huairou = pd.read_csv('/content/Programming_for_Data_Analysis/Data/PRSA_Data_Huairou_20130301-20170228.csv')
+
+    # combine dataframes into one
+    df_raw = pd.concat([df_dongsi, df_Gucheng, df_Changpingzhen, df_Huairou])
+
+    # station-wise imputation
+    df_station_imputed = df_raw.copy()
+    unique_stations = df_station_imputed['station'].unique()
+    imputed_dfs_list = []
+
+    for station_name in unique_stations:
+        station_df = df_station_imputed[df_station_imputed['station'] == station_name].copy()
+        numerical_cols_with_missing_station = station_df.select_dtypes(include=np.number).columns[station_df.select_dtypes(include=np.number).isnull().any()].tolist()
+
+        if numerical_cols_with_missing_station:
+            imputer = IterativeImputer(max_iter=10, random_state=0)
+            station_df[numerical_cols_with_missing_station] = imputer.fit_transform(station_df[numerical_cols_with_missing_station])
+
+        if 'wd' in station_df.columns and station_df['wd'].isnull().any():
+            mode_wd_station = station_df['wd'].mode()[0]
+            station_df['wd'] = station_df['wd'].fillna(mode_wd_station)
+
+        imputed_dfs_list.append(station_df)
+
+    df = pd.concat(imputed_dfs_list)
+
+    # Replace negative values with 0 for relevant columns
+    pollutant_and_rain_cols = ['PM2.5', 'PM10', 'SO2', 'NO2', 'CO', 'O3', 'RAIN']
+    for col in pollutant_and_rain_cols:
+        if col in df.columns:
+            df[col] = df[col].clip(lower=0)
+
+    # convert date and time to 'datetime' format and drop original columns
+    df['datetime'] = pd.to_datetime(df[['year', 'month', 'day', 'hour']])
+    df = df.drop(columns=['day', 'hour'])
+
+    # add coarse column
+    df['Coarse'] = df['PM10'] - df['PM2.5']
+    df['Coarse'] = df['Coarse'].clip(lower=0)
+    col_coarse = df.pop('Coarse')
+    df.insert(5, col_coarse.name, col_coarse)
+
+    # create a daily DataFrame for AQI calculations
+    df_daily = df.groupby(['station', df['datetime'].dt.date]).agg({
+        'PM2.5': 'mean',
+        'PM10': 'mean',
+        'SO2': 'mean',
+        'NO2': 'mean',
+        'CO': 'mean',
+        'O3': 'mean',
+        'TEMP': 'mean',
+        'PRES': 'mean',
+        'DEWP': 'mean',
+        'RAIN': 'sum',
+        'WSPM': 'mean',
+        'wd': lambda x: x.mode()[0] if not x.mode().empty else np.nan
+    }).reset_index()
+
+    df_daily = df_daily.rename(columns={'datetime': 'date'})
+
+    # convert CO from ug/m^3 to mg/m^3 before calculating IAQI for CO
+    df_daily['CO'] = df_daily['CO'] / 1000.0
+
+    # calculate IAQI for each pollutant in the daily df
+    pollutants_for_aqi_daily = ['PM2.5', 'PM10', 'SO2', 'NO2', 'CO', 'O3']
+    for p in pollutants_for_aqi_daily:
+        if p in df_daily.columns:
+            df_daily[f'IAQI_{p}'] = df_daily[p].apply(lambda x: calculate_iaqi(x, p))
+
+    # calculate the overall Daily AQI as the maximum of all individual AQIs
+    iaqi_columns_daily = [f'IAQI_{p}' for p in pollutants_for_aqi_daily if f'IAQI_{p}' in df_daily.columns]
+    if iaqi_columns_daily:
+        df_daily['Daily_AQI'] = df_daily[iaqi_columns_daily].max(axis=1)
+    else:
+        df_daily['Daily_AQI'] = np.nan
+
+    # create df_ann
+    df_ann = df_daily[['station', 'date', 'Daily_AQI', 'WSPM', 'wd', 'TEMP']].copy()
+    if 'wd_angle' not in df_ann.columns:
+        wind_direction_map = {
+            'N': 0, 'NNE': 22.5, 'NE': 45, 'ENE': 67.5,
+            'E': 90, 'ESE': 112.5, 'SE': 135, 'SSE': 157.5,
+            'S': 180, 'SSW': 202.5, 'SW': 225, 'WSW': 247.5,
+            'W': 270, 'WNW': 292.5, 'NW': 315, 'NNW': 337.5
+        }
+        df_ann['wd_angle'] = df_ann['wd'].map(wind_direction_map)
+
+    # Convert datetime columns to string for consistent caching
     if 'date' in df_daily.columns:
         df_daily['date'] = pd.to_datetime(df_daily['date']).dt.round('us').dt.strftime('%Y-%m-%d %H:%M:%S.%f')
     if 'datetime' in df.columns:
@@ -47,7 +194,8 @@ def load_model_and_history():
         y_pred_ts = pickle.load(f)
     return model, history_data, X_test_scaled, y_test_ts_original, y_pred_ts
 
-df, df_daily, df_ann = load_data()
+# Generate dataframes and load model
+df, df_daily, df_ann = generate_all_dataframes()
 model, history_data, X_test_scaled, y_test_ts_original, y_pred_ts = load_model_and_history()
 
 # plotting Functions
@@ -122,7 +270,7 @@ def make_rose_plot(df_to_process, column_name):
         grouped_data = grouped_data.sort_values('wd_angle')
         radians = np.deg2rad(grouped_data['wd_angle'])
         frequencies = grouped_data['frequency']
-        concentrations = grouped_data['mean_var'] # Use mean_var consistently
+        concentrations = grouped_data['mean_var']
         bar_colors = cmap(norm(concentrations))
 
         ax.bar(radians, frequencies, width=np.deg2rad(22.5),
@@ -145,7 +293,6 @@ def make_rose_plot(df_to_process, column_name):
 def plot_correlation_heatmap(data_frame, title_suffix=""):
     correlation_cols = ['PM2.5', 'Coarse', 'SO2', 'NO2', 'CO', 'O3', 'TEMP', 'PRES', 'DEWP', 'RAIN', 'WSPM']
 
-    # Check if 'Coarse' is a valid column before including it
     if 'Coarse' not in data_frame.columns:
         correlation_cols.remove('Coarse')
 
@@ -194,6 +341,10 @@ if page == "Dataset Overview":
 
     **PM10** - This value includes PM2.5 and is a record of particulate matter below 10 micrometres measured in ug/m^3. One should subtract the PM2.5 value to get coarse and fine particles separately.
 
+    **Coarse** - PM10 particulate matter with the PM2.5 content removed, measured in ug/m^3.
+
+    **Daily_AQI** - is the Air Quality Index for the day, using the chinese standards.
+
     **SO2** - Sulphur Dioxide  measured in ug/m^3.
 
     **NO2** - Nitrogen Dioxide,  measured in ug/m^3.
@@ -211,6 +362,8 @@ if page == "Dataset Overview":
     **RAIN** - gives rainfall measured in mm.
 
     **wd** - indicates the wind direction using compass points.
+
+    **wd_angle** - is the wind direction in degrees.
 
     **WSPM** - is the wind speed in m/s.
 
@@ -324,6 +477,10 @@ elif page == "Model Outputs":
     st.header("Model Outputs")
 
     st.subheader("Model Evaluation Metrics")
+
+    # Convert string dates back to datetime for evaluation if needed by original code logic
+    # For direct use of y_test_ts_original (already numeric), this conversion is not strictly needed here
+    # but important for consistency with how it was created from df_daily.date
 
     st.write(f'Test Loss (Huber on log(AQI+1)): {model.evaluate(X_test_scaled, np.log1p(y_test_ts_original), verbose=0)[0]:.4f}')
     st.write(f'Test Mean Absolute Error (on AQI scale): {np.mean(np.abs(y_test_ts_original - y_pred_ts)):.4f}')
