@@ -81,10 +81,10 @@ def calculate_iaqi(C, pollutant_name):
 @st.cache_data
 def generate_all_dataframes():
     # load monitoring station data CSV and make pandas dataframes
-    df_dongsi = pd.read_csv('/content/Programming_for_Data_Analysis/Data/PRSA_Data_Dongsi_20130301-20170228.csv')
-    df_Gucheng = pd.read_csv('/content/Programming_for_Data_Analysis/Data/PRSA_Data_Gucheng_20130301-20170228.csv')
-    df_Changpingzhen = pd.read_csv('/content/Programming_for_Data_Analysis/Data/PRSA_Data_Changping_20130301-20170228.csv')
-    df_Huairou = pd.read_csv('/content/Programming_for_Data_Analysis/Data/PRSA_Data_Huairou_20130301-20170228.csv')
+    df_dongsi = pd.read_csv(DATA_DIR/'PRSA_Data_Dongsi_20130301-20170228.csv')
+    df_Gucheng = pd.read_csv(DATA_DIR/'PRSA_Data_Gucheng_20130301-20170228.csv')
+    df_Changpingzhen = pd.read_csv(DATA_DIR/'PRSA_Data_Changping_20130301-20170228.csv')
+    df_Huairou = pd.read_csv(DATA_DIR/'PRSA_Data_Huairou_20130301-20170228.csv')
 
     # combine dataframes into one
     df_raw = pd.concat([df_dongsi, df_Gucheng, df_Changpingzhen, df_Huairou])
