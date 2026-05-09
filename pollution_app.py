@@ -18,6 +18,12 @@ from sklearn.impute import IterativeImputer
 from sklearn.metrics import mean_absolute_error
 import pickle
 
+from pathlib import Path
+
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "Data"
+
+
 # function to calculate Individual Air Quality Index (IAQI)
 def calculate_iaqi(C, pollutant_name):
     breakpoints = {
